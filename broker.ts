@@ -122,6 +122,16 @@ const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
 `);
 
+// H1 (ack-on-read): /peek-messages reads undelivered WITHOUT consuming, so the
+// server's auto-poll loop can surface a wake-notification without marking the
+// message delivered. The message is only consumed when the agent explicitly
+// reads it (check_messages -> /ack-messages). This stops idle/busy seats from
+// silently losing messages: an unread message stays delivered=0 and re-surfaces
+// on the seat's next activity / session restart.
+const markDeliveredForPeer = db.prepare(`
+  UPDATE messages SET delivered = 1 WHERE id = ? AND to_id = ?
+`);
+
 // --- Generate peer ID ---
 
 function generateId(): string {
@@ -219,6 +229,22 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages };
 }
 
+// H1: non-consuming read. Returns undelivered messages but does NOT mark them
+// delivered — used by the auto-poll loop to push wake-notifications.
+function handlePeekMessages(body: PollMessagesRequest): PollMessagesResponse {
+  const messages = selectUndelivered.all(body.id) as Message[];
+  return { messages };
+}
+
+// H1: explicit ack. The agent has actually read these message ids — consume
+// them. Scoped to the requesting peer so a peer can only ack its own mail.
+function handleAckMessages(body: { id: string; message_ids: number[] }): { ok: boolean } {
+  for (const mid of body.message_ids ?? []) {
+    markDeliveredForPeer.run(mid, body.id);
+  }
+  return { ok: true };
+}
+
 function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
@@ -257,6 +283,10 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/peek-messages":
+          return Response.json(handlePeekMessages(body as PollMessagesRequest));
+        case "/ack-messages":
+          return Response.json(handleAckMessages(body as { id: string; message_ids: number[] }));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });

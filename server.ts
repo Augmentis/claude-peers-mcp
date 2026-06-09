@@ -139,6 +139,14 @@ let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
+// H1: ids we've already surfaced as a wake-notification this server lifetime.
+// The broker no longer consumes on poll, so we dedupe pushes in-process. The
+// message stays undelivered in the broker until the agent explicitly reads it
+// (check_messages -> /ack-messages); on a session restart this set resets and
+// any still-unread message is re-surfaced. So a message to an idle seat is
+// never lost — only deferred to its next activity.
+const pushedIds = new Set<number>();
+
 // --- MCP Server ---
 
 const mcp = new Server(
@@ -153,6 +161,8 @@ const mcp = new Server(
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
 Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
+
+Messages are now DURABLE: a message you are sent persists until you have actually read it, so a ping is never lost just because you were busy or idle when it arrived. After you have read and handled your peer messages, call check_messages to acknowledge them — this clears them so they are not re-surfaced when your session restarts. If you suspect you missed a tap, call check_messages to drain anything pending.
 
 Available tools:
 - list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
@@ -364,12 +374,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+        // H1: explicit read = ack. PEEK then ACK the ids we return — this is
+        // the consuming path (the auto-loop never consumes). Reading here is
+        // the agent's acknowledgement that it has actually seen the messages.
+        const result = await brokerFetch<PollMessagesResponse>("/peek-messages", { id: myId });
         if (result.messages.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
         }
+        await brokerFetch("/ack-messages", {
+          id: myId,
+          message_ids: result.messages.map((m) => m.id),
+        });
         const lines = result.messages.map(
           (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
         );
@@ -405,9 +422,14 @@ async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    // H1: PEEK (non-consuming) — do NOT mark delivered here. We only push a
+    // wake-notification once per message per server lifetime; the message stays
+    // undelivered until the agent explicitly reads it via check_messages.
+    const result = await brokerFetch<PollMessagesResponse>("/peek-messages", { id: myId });
 
     for (const msg of result.messages) {
+      if (pushedIds.has(msg.id)) continue; // already surfaced this lifetime
+      pushedIds.add(msg.id);
       // Look up the sender's info for context
       let fromSummary = "";
       let fromCwd = "";
